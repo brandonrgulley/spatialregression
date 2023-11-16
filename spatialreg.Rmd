@@ -1,0 +1,262 @@
+---
+title: "Spatial Regression"
+author: "Brandon Gulley"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+
+library(biscale)
+library(car)
+library(cleangeo)
+library(cowplot)
+library(geosphere)
+library(maps)
+library(mapproj)
+library(maptools)
+library(spatialreg)
+library(spdep)
+library(tidyverse)
+library(visreg)
+
+```
+
+install.packages("maptools", repos="http://R-Forge.R-project.org")
+
+``` {r data, echo=FALSE, include=TRUE}
+
+data <- read.csv('https://raw.githubusercontent.com/chrismgentry/Spatial-Regression/master/Data/childpov18_southfull.csv', 
+                 colClasses = c("character", "character", "character", 
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric", 
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric", 
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric"))
+
+```
+
+``` {r rename, echo=FALSE, include=TRUE}
+
+names(data)[names(data)=="X2016.child.poverty"] <- "child.pov.2016"
+
+```
+
+``` {r AR subset, echo=FALSE, include=FALSE}
+
+ar_pov <- data %>% subset(State == "AR")
+
+summary(ar_pov)
+
+equation <- child.pov.2016 ~ rural + urban + lnmanufacturing + lnag + 
+  lnretail + lnhealthss + lnconstruction + lnlesshs + 
+  lnunemployment + lnsinglemom + lnblack + lnhispanic + 
+  lnuninsured + lnincome_ratio + lnteenbirth + lnunmarried
+
+options(scipen = 5)
+
+```
+
+# **Ordinary Least Squares Model**
+
+``` {r model ols, echo=FALSE, include=TRUE}
+
+ols <- lm(equation, data=ar_pov)
+
+summary(ols)
+
+par(mfrow=c(4,4), mar=c(2, 2, 2, 2))
+visreg(ols)
+
+```
+
+# **Contiguity**
+
+``` {r contiguity, echo=FALSE, include=TRUE}
+
+fips <- county.fips
+fips.codes <- separate(data = fips, col = polyname, into = c("state", "county"), sep = ",")
+ar_fips <- subset(fips.codes, state=="arkansas", select=fips)
+
+arkansas <- maps::map(database = "county", regions = "arkansas", fill=T, plot=F)
+ar_sp = map2SpatialPolygons(arkansas,ar_fips$fips,CRS("+proj=longlat"))
+
+cleaned <- clgeo_Clean(ar_sp)
+neighb.data <- poly2nb(cleaned, queen=T)
+cont.neighb <- nb2listw(neighb.data,style="W", zero.policy = TRUE)
+
+```
+
+
+
+``` {r moran, echo=FALSE, include=TRUE}
+
+lm.morantest(ols, cont.neighb)
+
+lm.LMtests(ols, cont.neighb, test="all")
+
+SLX.model <- spatialreg::lmSLX(equation, data=ar_pov, cont.neighb)
+
+summary(SLX.model)
+
+summary(spatialreg::impacts(SLX.model, cont.neighb), zstats = TRUE)[["pzmat"]]
+
+```
+
+**STOP! Neither LM-Err or LM-Lag are significant, so we are keeping the OLS results! Looking at the OLS results, it seems that being born to a teenage mother is the biggest predictor of child poverty (who would've guessed). Just for funsies though, I still ran the other models.**
+
+# **Spatial Lag Model**
+
+``` {r lag, echo=FALSE, include=TRUE}
+
+sp.lag.model <- spatialreg::lagsarlm(equation, data=ar_pov, cont.neighb)
+
+summary(sp.lag.model, Nagelkerke = TRUE)
+
+summary(spatialreg::impacts(sp.lag.model, listw = cont.neighb, R=100), zstats = TRUE)[["pzmat"]]
+
+```
+
+# **Spatial Error Model**
+
+``` {r spatialerror, echo=FALSE, include=TRUE}
+
+sp.err.model <- spatialreg::errorsarlm(equation, data=ar_pov, cont.neighb)
+
+summary(sp.err.model, Nagelkerke = TRUE)
+
+spatialreg::Hausman.test(sp.err.model)
+
+sd.err <- spatialreg::errorsarlm(equation, ar_pov, cont.neighb, etype = "emixed")
+sdm <- spatialreg::lagsarlm(equation, ar_pov, cont.neighb, type = "mixed")
+
+summary(sd.err, Nagelkerke = TRUE)
+
+summary(spatialreg::impacts(sd.err, listw = cont.neighb, R = 100), zstats = TRUE)[["pzmat"]]
+
+LR.Sarlm(sd.err,sp.err.model)
+
+```
+
+# **Building Neighbors**
+
+``` {r neighbors, echo=FALSE, include=TRUE}
+
+all.xy <-centroid(ar_sp)
+colnames(all.xy) <- c("x","y")
+
+#Create neighbors
+all.dist.k1 <- knn2nb(knearneigh(all.xy, k=1, longlat = TRUE))
+all.dist.k3 <- knn2nb(knearneigh(all.xy, k=3, longlat = TRUE))
+all.dist.k5 <- knn2nb(knearneigh(all.xy, k=5, longlat = TRUE))
+
+#Determine max k distance value to neighbor
+all.max.k1 <- max(unlist(nbdists(all.dist.k1, all.xy, longlat=TRUE)))
+all.max.k3 <- max(unlist(nbdists(all.dist.k3, all.xy, longlat=TRUE)))
+all.max.k5 <- max(unlist(nbdists(all.dist.k5, all.xy, longlat=TRUE)))
+
+#Calculate neighbors based on distance
+all.sp.dist.k1 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k1, longlat = TRUE)
+all.sp.dist.k3 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k3, longlat = TRUE)
+all.sp.dist.k5 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k5, longlat = TRUE)
+
+#Create neighbor list
+all.dist.neighb.k1 <- nb2listw(all.sp.dist.k1,style="W", zero.policy = TRUE)
+all.dist.neighb.k3 <- nb2listw(all.sp.dist.k3,style="W", zero.policy = TRUE)
+all.dist.neighb.k5 <- nb2listw(all.sp.dist.k5,style="W", zero.policy = TRUE)
+
+all.dist.lag.k1 <- spatialreg::lagsarlm(equation, data = ar_pov, listw = all.dist.neighb.k1)
+all.dist.lag.k3 <- spatialreg::lagsarlm(equation, data = ar_pov, listw = all.dist.neighb.k3)
+all.dist.lag.k5 <- spatialreg::lagsarlm(equation, data = ar_pov, listw = all.dist.neighb.k5)
+
+summary(all.dist.lag.k1, Nagelkerke = TRUE)
+
+```
+
+# **Distance Error Model**
+
+``` {r distance error, echo=FALSE, include=TRUE}
+
+all.dist.err.k1 <- spatialreg::errorsarlm(equation, data = ar_pov, listw = all.dist.neighb.k1)
+all.dist.err.k3 <- spatialreg::errorsarlm(equation, data = ar_pov, listw = all.dist.neighb.k3)
+all.dist.err.k5 <- spatialreg::errorsarlm(equation, data = ar_pov, listw = all.dist.neighb.k5)
+
+summary(all.dist.err.k1, Nagelkerke = TRUE)
+
+```
+
+# **Map of our Results**
+
+``` {r map, echo=FALSE, include=FALSE}
+
+dist.err.data <- summary(all.dist.err.k1, correlation=TRUE, Nagelkerke = TRUE)
+
+dist.err.output <- cbind.data.frame(ar_pov$FIPS,
+                                    dist.err.data$fitted.values, 
+                                    dist.err.data$residual, 
+                                    ar_pov$child.pov.2016, 
+                                    ar_pov$lnsinglemom, 
+                                    ar_pov$lnuninsured, 
+                                    ar_pov$lnlesshs, 
+                                    ar_pov$lnincome_ratio,
+                                    ar_pov$lnteenbirth,
+                                    stringsAsFactors = FALSE)
+
+#Renaming columns
+colnames(dist.err.output) <- c("fips","fitted","resid","childpov",
+                        "single_mom","uninsured","less_hs","income_ratio", "teenbirth")
+
+ar_fortify <- fortify(ar_sp)
+
+ar_poly <- merge(x = ar_fortify, y = dist.err.output, 
+                 by.x = "id", by.y = "fips", all = TRUE)
+
+bivariate_data <- bi_class(ar_poly, x = childpov, y = teenbirth, 
+                           dim = 3, style = "quantile")
+
+legend <- bi_legend(pal = "DkViolet",
+                    dim = 3,
+                    xlab = "Child Poverty",
+                    ylab = "Teenage Mothers",
+                    size = 6)
+
+world <- map_data("world")
+states <- map_data("state")
+southern_states <- subset(states, region %in% 
+                            c("texas", "arkansas", "louisiana", "mississippi", 
+                              "alabama", "georgia", "florida", "north carolina",
+                              "south carolina", "tennessee", "oklahoma", 
+                              "kentucky", "west virginia", "virginia", 
+                              "maryland", "delaware", "district of columbia"))
+
+mom_pov_map <- ggplot() + 
+  geom_polygon(data = world, aes(x=long,y=lat, group=group), fill = "gray95", color = "white") +
+  geom_polygon(data = states, aes(x=long,y=lat, group=group), fill = "gray", color = "white") +
+  geom_polygon(data = southern_states, aes(x=long,y=lat, group=group), fill = NA, size = 0.01, color = "white") +  
+  geom_polygon(data = bivariate_data, aes(x=long, y=lat, group=group, fill = bi_class), color = "grey50", show.legend = FALSE) + 
+  bi_scale_fill(pal = "DkViolet", dim = 3) +
+  coord_map("conic", lat0 = 30, xlim=c(-95,-80), ylim=c(25,37)) +
+  theme_void() + theme(legend.title.align=0.5) +
+  theme(panel.background = element_rect(fill = 'deepskyblue'),
+        panel.grid.major = element_line(colour = NA)) +
+  labs(x = "Longitude", y = "Latitude", fill = "Child Poverty", 
+       title = "Bivariate Map of Child Poverty and Teenage Mother Households") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+mom_pov_map
+
+```
+
+``` {r final, echo=FALSE, include=TRUE}
+
+final_map <- ggdraw() +
+  draw_plot(mom_pov_map, 0, 0, 1, 1) +
+  draw_plot(legend, 0.400, 0.225, 0.35, 0.35)
+final_map
+
+```
